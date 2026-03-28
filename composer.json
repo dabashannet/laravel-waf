@@ -1,0 +1,29 @@
+{
+    "name": "dabashan/bt-laravel-waf",
+    "description": "大巴山宝塔WAF - Laravel防护中间件",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "四川大巴山网络科技有限公司",
+            "homepage": "https://www.dabashan.cc"
+        }
+    ],
+    "require": {
+        "php": ">=8.0",
+        "illuminate/support": "^9.0|^10.0|^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Dabashan\\BtLaravelWaf\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Dabashan\\BtLaravelWaf\\DbswafServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable"
+}
