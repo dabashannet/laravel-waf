@@ -3,18 +3,30 @@
 namespace Dabashan\BtLaravelWaf\Middleware;
 
 use Closure;
-use Dabashan\BtLaravelWaf\Events\AttackDetected;
-use Dabashan\BtLaravelWaf\Events\IpBanned;
-use Dabashan\BtLaravelWaf\Services\CcProtection;
+use Dabashan\BtLaravelWaf\Services\ThreatDetector;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Symfony\Component\HttpFoundation\Response;
 
+/**
+ * DbswafProtection - 纯遥测中间件
+ *
+ * 职责（仅遥测，不拦截）：
+ *   1. 始终放行所有请求（实际防护由 Nginx access_by_lua 层承担）
+ *   2. 收集统一遥测数据（time、ip、domain、method、uri、status_code、response_time_ms）
+ *   3. 调用 ThreatDetector 检测异常（仅记录，不拦截）
+ *   4. 写入 /www/server/dbswaf/logs/telemetry_laravel_YYYYMMDD.log
+ */
 class DbswafProtection
 {
+    /** @var array 内存中缓冲的遥测日志行，按日志文件路径分组 */
+    private static array $telemetryBuffer = [];
+
+    /** @var bool 是否已注册 shutdown 函数 */
+    private static bool $shutdownRegistered = false;
+
     public function __construct(
-        protected CcProtection $ccProtection
+        protected ThreatDetector $threatDetector
     ) {}
 
     public function handle(Request $request, Closure $next): Response
@@ -23,208 +35,103 @@ class DbswafProtection
             return $next($request);
         }
 
-        $ip   = $request->ip();
-        $path = $request->path();
+        $startTime = microtime(true);
 
-        // 静态资源快速放行
-        if ($this->isStaticResource($path)) {
-            return $next($request);
-        }
-
-        // 白名单 IP 直接放行
-        if ($this->isWhitelistedIp($ip)) {
-            return $next($request);
-        }
-
-        // 检查 IP 是否已被封禁
-        if ($this->isIpBanned($ip)) {
-            return $this->blockResponse($request, '您的 IP 已被封禁，如有疑问请联系管理员');
-        }
-
-        // CC 防护（速率限制）
-        $ccResult = $this->ccProtection->check($request);
-        if (!$ccResult['allowed']) {
-            event(new IpBanned($ip, 'CC攻击', $ccResult['ban_time'] ?? 600));
-            $this->reportToWaf($request, 'cc_attack', $ccResult);
-            return $this->blockResponse($request, '请求过于频繁，请稍后再试', 429);
-        }
-
-        // 检测异常请求特征
-        $anomaly = $this->detectAnomalies($request);
-        if ($anomaly) {
-            event(new AttackDetected($ip, $anomaly['type'], $anomaly['detail'], $request));
-            Log::warning('[DBSWAF] 异常请求检测', [
-                'ip'     => $ip,
-                'path'   => $path,
-                'type'   => $anomaly['type'],
-                'detail' => $anomaly['detail'],
-            ]);
-            if ($anomaly['block']) {
-                $this->reportToWaf($request, $anomaly['type'], $anomaly);
-                return $this->blockResponse($request, '请求被安全策略拦截');
-            }
-        }
-
+        // 始终放行——实际防护由 Nginx Lua 层负责
         $response = $next($request);
 
-        if (config('dbswaf.report_interval') > 0) {
-            $this->incrementRequestCounter($ip, $path);
-        }
+        $this->collectTelemetry($request, $response, $startTime);
 
         return $response;
     }
 
-    protected function isStaticResource(string $path): bool
-    {
-        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
-        if (in_array($ext, ['css', 'js', 'png', 'jpg', 'jpeg', 'gif', 'ico', 'svg', 'woff', 'woff2', 'ttf', 'eot', 'map', 'webp'])) {
-            return true;
-        }
-
-        $excludePaths = config('dbswaf.cc_protection.exclude_paths', []);
-        foreach ($excludePaths as $pattern) {
-            $normalized = rtrim($pattern, '/*');
-            if (str_starts_with('/' . $path, $normalized)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    protected function isWhitelistedIp(string $ip): bool
-    {
-        $whitelist = config('dbswaf.cc_protection.whitelist', []);
-        if (empty($whitelist)) {
-            return false;
-        }
-        return in_array($ip, $whitelist, true);
-    }
-
-    protected function isIpBanned(string $ip): bool
-    {
-        return Cache::has('dbswaf:banned:' . md5($ip));
-    }
-
-    protected function detectAnomalies(Request $request): ?array
-    {
-        // 超大请求体检测
-        $contentLength = (int) $request->header('Content-Length', 0);
-        $maxSize = config('dbswaf.max_body_size', 10 * 1024 * 1024);
-        if ($contentLength > $maxSize) {
-            return [
-                'type'   => 'oversized_body',
-                'detail' => "Content-Length: {$contentLength} bytes 超过限制 {$maxSize}",
-                'block'  => true,
-            ];
-        }
-
-        // 异常 User-Agent 检测
-        $ua = $request->userAgent() ?? '';
-        if (empty($ua)) {
-            return [
-                'type'   => 'empty_useragent',
-                'detail' => '请求缺少 User-Agent',
-                'block'  => false,
-            ];
-        }
-
-        // 已知扫描器/攻击工具特征检测
-        $maliciousUaPatterns = [
-            'sqlmap', 'nikto', 'nmap', 'masscan', 'zgrab',
-            'python-requests/2.', 'Go-http-client/1.', 'curl/7.',
-            'dirbuster', 'w3af', 'acunetix', 'nessus', 'openvas',
-        ];
-        $uaLower = strtolower($ua);
-        foreach ($maliciousUaPatterns as $pattern) {
-            if (str_contains($uaLower, $pattern)) {
-                return [
-                    'type'   => 'scanner_useragent',
-                    'detail' => "检测到扫描工具特征: {$pattern}",
-                    'block'  => true,
-                ];
-            }
-        }
-
-        // Host 头注入检测
-        $host = $request->getHost();
-        $allowedHosts = config('dbswaf.allowed_hosts', []);
-        if (!empty($allowedHosts) && !in_array($host, $allowedHosts, true)) {
-            return [
-                'type'   => 'host_injection',
-                'detail' => "Host 头异常: {$host}",
-                'block'  => true,
-            ];
-        }
-
-        // 过多请求头检测
-        $headerCount = count($request->headers->all());
-        if ($headerCount > 50) {
-            return [
-                'type'   => 'abnormal_headers',
-                'detail' => "请求头数量异常: {$headerCount}",
-                'block'  => false,
-            ];
-        }
-
-        return null;
-    }
-
-    protected function reportToWaf(Request $request, string $attackType, array $detail = []): void
+    /**
+     * 收集遥测数据（不阻断请求）
+     */
+    protected function collectTelemetry(Request $request, Response $response, float $startTime): void
     {
         try {
-            $wafServer = config('dbswaf.waf_server', '127.0.0.1:8899');
-            if (empty($wafServer)) {
-                return;
+            $responseTimeMs = round((microtime(true) - $startTime) * 1000, 2);
+            $statusCode     = $response->getStatusCode();
+
+            $record = [
+                'time'             => date('Y-m-d H:i:s'),
+                'ip'               => $request->ip(),
+                'domain'           => $request->getHost(),
+                'method'           => $request->method(),
+                'uri'              => $request->path() === '/' ? '/' : '/' . $request->path(),
+                'status_code'      => $statusCode,
+                'response_time_ms' => $responseTimeMs,
+                'source'           => 'laravel-middleware',
+            ];
+
+            // 异常行为检测（仅标记，不拦截）
+            $anomaly = $this->threatDetector->detectAnomalies($request);
+            if ($anomaly !== null) {
+                $record['anomaly'] = $anomaly;
+                Log::debug('[DBSWAF] 异常请求遥测', [
+                    'ip'     => $record['ip'],
+                    'uri'    => $record['uri'],
+                    'type'   => $anomaly['type'],
+                    'severity' => $anomaly['severity'] ?? 'unknown',
+                ]);
             }
 
-            $payload = json_encode([
-                'type'      => $attackType,
-                'ip'        => $request->ip(),
-                'uri'       => $request->getRequestUri(),
-                'method'    => $request->method(),
-                'ua'        => $request->userAgent(),
-                'detail'    => $detail,
-                'timestamp' => time(),
-                'domain'    => $request->getHost(),
-            ]);
+            // 写入内存缓冲
+            $wafDir  = config('dbswaf.waf_path', '/www/server/dbswaf');
+            $logDir  = $wafDir . '/logs';
+            $logFile = $logDir . '/telemetry_laravel_' . date('Ymd') . '.log';
 
-            $cacheKey = 'dbswaf:pending_reports';
-            $reports  = Cache::get($cacheKey, []);
-            $reports[] = $payload;
+            self::$telemetryBuffer[$logFile][] = json_encode($record, JSON_UNESCAPED_UNICODE);
 
-            if (count($reports) > 100) {
-                $reports = array_slice($reports, -100);
+            // 缓冲达到阈值时立即刷写
+            $bufferSize = (int) config('dbswaf.telemetry_buffer_size', 50);
+            if (count(self::$telemetryBuffer[$logFile]) >= $bufferSize) {
+                $this->flushBuffer($logFile, $logDir);
             }
 
-            Cache::put($cacheKey, $reports, now()->addMinutes(10));
+            // 注册进程结束时批量写入
+            if (!self::$shutdownRegistered) {
+                self::$shutdownRegistered = true;
+                register_shutdown_function(static function () {
+                    foreach (self::$telemetryBuffer as $file => $lines) {
+                        if (empty($lines)) {
+                            continue;
+                        }
+                        $dir = dirname($file);
+                        if (!is_dir($dir)) {
+                            @mkdir($dir, 0755, true);
+                        }
+                        @file_put_contents($file, implode("\n", $lines) . "\n", FILE_APPEND | LOCK_EX);
+                    }
+                    self::$telemetryBuffer = [];
+                });
+            }
+
         } catch (\Throwable $e) {
-            Log::debug('[DBSWAF] 上报失败: ' . $e->getMessage());
+            // 遥测失败不影响业务
         }
     }
 
-    protected function incrementRequestCounter(string $ip, string $path): void
+    /**
+     * 将单个文件的缓冲立即刷写到磁盘
+     */
+    protected function flushBuffer(string $logFile, string $logDir): void
     {
-        try {
-            $hourKey = 'dbswaf:req_count:' . date('YmdH');
-            Cache::increment($hourKey);
-            Cache::put($hourKey, Cache::get($hourKey, 1), now()->addHours(2));
-        } catch (\Throwable $e) {
-            // 统计失败不影响主流程
-        }
-    }
-
-    protected function blockResponse(Request $request, string $message, int $status = 403): Response
-    {
-        if ($request->expectsJson() || $request->is('api/*')) {
-            return response()->json([
-                'error'   => true,
-                'message' => $message,
-                'code'    => $status,
-            ], $status);
+        if (empty(self::$telemetryBuffer[$logFile])) {
+            return;
         }
 
-        return response(view('dbswaf::blocked', compact('message', 'status'))->render(), $status)
-            ->header('Content-Type', 'text/html; charset=utf-8');
+        if (!is_dir($logDir)) {
+            @mkdir($logDir, 0755, true);
+        }
+
+        @file_put_contents(
+            $logFile,
+            implode("\n", self::$telemetryBuffer[$logFile]) . "\n",
+            FILE_APPEND | LOCK_EX
+        );
+
+        self::$telemetryBuffer[$logFile] = [];
     }
 }
