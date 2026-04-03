@@ -16,6 +16,8 @@ use Symfony\Component\HttpFoundation\Response;
  *   2. 收集统一遥测数据（time、ip、domain、method、uri、status_code、response_time_ms）
  *   3. 调用 ThreatDetector 检测异常（仅记录，不拦截）
  *   4. 写入 /www/server/dbswaf/logs/telemetry_laravel_YYYYMMDD.log
+ *
+ * 兼容：Laravel 9 / 10 / 11 / 12
  */
 class DbswafProtection
 {
